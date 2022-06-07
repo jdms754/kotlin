@@ -182,7 +182,7 @@ private fun getJsDependencies(module: TestModule, testServices: TestServices): T
     return Triple(runtimeKlibsPaths, transitiveLibraries, friendLibraries)
 }
 
-private fun getAllJsDependenciesPaths(module: TestModule, testServices: TestServices): List<String> {
+internal fun getAllJsDependenciesPaths(module: TestModule, testServices: TestServices): List<String> {
     val (runtimeKlibsPaths, transitiveLibraries, friendLibraries) = getJsDependencies(module, testServices)
     return runtimeKlibsPaths + transitiveLibraries.map { it.path } + friendLibraries.map { it.path }
 }
@@ -282,7 +282,7 @@ private fun configureLibrarySessionForJvmOrCommon(
 
     val projectFileSearchScope = PsiBasedProjectFileSearchScope(librariesScope)
 
-    return FirSessionFactory.createLibrarySession(
+    return FirSessionFactory.createJvmLibrarySession(
         moduleName,
         sessionProvider,
         dependencyList.moduleDataProvider,
