@@ -41,6 +41,7 @@ import org.jetbrains.kotlin.ir.linkage.IrProvider
 import org.jetbrains.kotlin.ir.symbols.IrSymbol
 import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.acceptVoid
+import org.jetbrains.kotlin.js.analyze.AbstractTopDownAnalyzerFacadeForJS
 import org.jetbrains.kotlin.js.analyzer.JsAnalysisResult
 import org.jetbrains.kotlin.js.config.ErrorTolerancePolicy
 import org.jetbrains.kotlin.js.config.JSConfigurationKeys
@@ -492,22 +493,6 @@ fun getIrModuleInfoForSourceFiles(
     )
 }
 
-fun prepareAnalyzedSourceModule(
-    project: Project,
-    files: List<KtFile>,
-    configuration: CompilerConfiguration,
-    dependencies: List<String>,
-    friendDependencies: List<String>,
-    analyzer: AbstractAnalyzerWithCompilerReport,
-    errorPolicy: ErrorTolerancePolicy = configuration.get(JSConfigurationKeys.ERROR_TOLERANCE_POLICY) ?: ErrorTolerancePolicy.DEFAULT,
-): ModulesStructure {
-    val mainModule = MainModule.SourceFiles(files)
-    val sourceModule = ModulesStructure(project, mainModule, configuration, dependencies, friendDependencies)
-    return sourceModule.apply {
-        runAnalysis(errorPolicy, analyzer)
-    }
-}
-
 private fun preparePsi2Ir(
     depsDescriptors: ModulesStructure,
     errorIgnorancePolicy: ErrorTolerancePolicy,
@@ -641,12 +626,12 @@ class ModulesStructure(
 
     lateinit var jsFrontEndResult: JsFrontEndResult
 
-    fun runAnalysis(errorPolicy: ErrorTolerancePolicy, analyzer: AbstractAnalyzerWithCompilerReport) {
+    fun runAnalysis(errorPolicy: ErrorTolerancePolicy, analyzer: AbstractAnalyzerWithCompilerReport, analyzerFacade: AbstractTopDownAnalyzerFacadeForJS) {
         require(mainModule is MainModule.SourceFiles)
         val files = mainModule.files
 
         analyzer.analyzeAndReport(files) {
-            TopDownAnalyzerFacadeForJSIR.analyzeFiles(
+            analyzerFacade.analyzeFiles(
                 files,
                 project,
                 compilerConfiguration,
@@ -673,7 +658,7 @@ class ModulesStructure(
             else hasErrors = true
         }
 
-        hasErrors = TopDownAnalyzerFacadeForJSIR.checkForErrors(files, analysisResult.bindingContext, errorPolicy) || hasErrors
+        hasErrors = analyzerFacade.checkForErrors(files, analysisResult.bindingContext, errorPolicy) || hasErrors
 
         jsFrontEndResult = JsFrontEndResult(analysisResult, hasErrors)
     }
