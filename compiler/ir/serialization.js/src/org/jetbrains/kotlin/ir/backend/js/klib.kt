@@ -18,9 +18,7 @@ import org.jetbrains.kotlin.backend.common.overrides.FakeOverrideChecker
 import org.jetbrains.kotlin.backend.common.serialization.*
 import org.jetbrains.kotlin.backend.common.serialization.mangle.ManglerChecker
 import org.jetbrains.kotlin.backend.common.serialization.mangle.descriptor.Ir2DescriptorManglerAdapter
-import org.jetbrains.kotlin.backend.common.serialization.metadata.DynamicTypeDeserializer
-import org.jetbrains.kotlin.backend.common.serialization.metadata.KlibMetadataIncrementalSerializer
-import org.jetbrains.kotlin.backend.common.serialization.metadata.KlibMetadataVersion
+import org.jetbrains.kotlin.backend.common.serialization.metadata.*
 import org.jetbrains.kotlin.backend.common.serialization.signature.IdSignatureDescriptor
 import org.jetbrains.kotlin.builtins.KotlinBuiltIns
 import org.jetbrains.kotlin.config.*
@@ -37,7 +35,6 @@ import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
 import org.jetbrains.kotlin.ir.declarations.impl.IrFileImpl
 import org.jetbrains.kotlin.ir.descriptors.IrDescriptorBasedFunctionFactory
 import org.jetbrains.kotlin.ir.linkage.IrDeserializer
-import org.jetbrains.kotlin.ir.linkage.IrProvider
 import org.jetbrains.kotlin.ir.symbols.IrSymbol
 import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.acceptVoid
@@ -59,7 +56,6 @@ import org.jetbrains.kotlin.psi2ir.Psi2IrConfiguration
 import org.jetbrains.kotlin.psi2ir.Psi2IrTranslator
 import org.jetbrains.kotlin.psi2ir.descriptors.IrBuiltInsOverDescriptors
 import org.jetbrains.kotlin.psi2ir.generators.DeclarationStubGeneratorImpl
-import org.jetbrains.kotlin.psi2ir.generators.DeclarationStubGeneratorForNotFoundClasses
 import org.jetbrains.kotlin.psi2ir.generators.GeneratorContext
 import org.jetbrains.kotlin.psi2ir.generators.TypeTranslatorImpl
 import org.jetbrains.kotlin.resolve.BindingContext
@@ -69,7 +65,6 @@ import org.jetbrains.kotlin.storage.StorageManager
 import org.jetbrains.kotlin.util.DummyLogger
 import org.jetbrains.kotlin.util.Logger
 import org.jetbrains.kotlin.utils.DFS
-import org.jetbrains.kotlin.utils.addToStdlib.runIf
 import java.io.File
 
 val KotlinLibrary.moduleName: String
@@ -214,9 +209,9 @@ fun generateKLib(
     jsOutputName: String?,
     icData: MutableList<KotlinFileSerializedData>,
     expectDescriptorToSymbol: MutableMap<DeclarationDescriptor, IrSymbol>,
-    moduleFragment: IrModuleFragment
+    moduleFragment: IrModuleFragment,
+    serializeSingleFile: (KtFile) -> ProtoBuf.PackageFragment
 ) {
-    val project = depsDescriptors.project
     val files = (depsDescriptors.mainModule as MainModule.SourceFiles).files
     val configuration = depsDescriptors.compilerConfiguration
     val allDependencies = depsDescriptors.allDependencies.map { it.library }
@@ -224,10 +219,8 @@ fun generateKLib(
 
     serializeModuleIntoKlib(
         configuration[CommonConfigurationKeys.MODULE_NAME]!!,
-        project,
         configuration,
         messageLogger,
-        depsDescriptors.jsFrontEndResult.bindingContext,
         files,
         outputKlibPath,
         allDependencies,
@@ -238,7 +231,8 @@ fun generateKLib(
         perFile = false,
         depsDescriptors.jsFrontEndResult.hasErrors,
         abiVersion,
-        jsOutputName
+        jsOutputName,
+        serializeSingleFile
     )
 }
 
@@ -689,10 +683,8 @@ private fun getDescriptorForElement(
 
 fun serializeModuleIntoKlib(
     moduleName: String,
-    project: Project,
     configuration: CompilerConfiguration,
     messageLogger: IrMessageLogger,
-    bindingContext: BindingContext,
     files: List<KtFile>,
     klibPath: String,
     dependencies: List<KotlinLibrary>,
@@ -704,6 +696,7 @@ fun serializeModuleIntoKlib(
     containsErrorCode: Boolean = false,
     abiVersion: KotlinAbiVersion,
     jsOutputName: String?,
+    serializeSingleFile: (KtFile) -> ProtoBuf.PackageFragment
 ) {
     assert(files.size == moduleFragment.files.size)
 
@@ -723,7 +716,6 @@ fun serializeModuleIntoKlib(
         ).serializedIrModule(moduleFragment)
 
     val moduleDescriptor = moduleFragment.descriptor
-    val metadataSerializer = KlibMetadataIncrementalSerializer(configuration, project, containsErrorCode)
 
     val incrementalResultsConsumer = configuration.get(JSConfigurationKeys.INCREMENTAL_RESULTS_CONSUMER)
     val empty = ByteArray(0)
@@ -746,7 +738,7 @@ fun serializeModuleIntoKlib(
                 Ir: ${binaryFile.path}
             """.trimMargin()
         }
-        val packageFragment = metadataSerializer.serializeScope(ktFile, bindingContext, moduleDescriptor)
+        val packageFragment = serializeSingleFile(ktFile)
         val compiledKotlinFile = KotlinFileSerializedData(packageFragment.toByteArray(), binaryFile)
 
         additionalFiles += compiledKotlinFile
@@ -755,17 +747,18 @@ fun serializeModuleIntoKlib(
 
     val compiledKotlinFiles = (cleanFiles + additionalFiles)
 
-    val header = metadataSerializer.serializeHeader(
-        moduleDescriptor,
+    val header = serializeKlibHeader(
+        configuration.languageVersionSettings, moduleDescriptor,
         compiledKotlinFiles.map { it.irData.fqName }.distinct().sorted(),
         emptyList()
     ).toByteArray()
+
     incrementalResultsConsumer?.run {
         processHeader(header)
     }
 
     val serializedMetadata =
-        metadataSerializer.serializedMetadata(
+        makeSerializedKlibMetadata(
             compiledKotlinFiles.groupBy { it.irData.fqName }
                 .map { (fqn, data) -> fqn to data.sortedBy { it.irData.path }.map { it.metadata } }.toMap(),
             header
@@ -807,7 +800,7 @@ fun serializeModuleIntoKlib(
 
 const val KLIB_PROPERTY_JS_OUTPUT_NAME = "jsOutputName"
 
-private fun KlibMetadataIncrementalSerializer.serializeScope(
+fun KlibMetadataIncrementalSerializer.serializeScope(
     ktFile: KtFile,
     bindingContext: BindingContext,
     moduleDescriptor: ModuleDescriptor
@@ -836,7 +829,7 @@ private fun compareMetadataAndGoToNextICRoundIfNeeded(
     if (nextRoundChecker.shouldGoToNextRound()) throw IncrementalNextRoundException()
 }
 
-private fun KlibMetadataIncrementalSerializer(configuration: CompilerConfiguration, project: Project, allowErrors: Boolean) =
+fun KlibMetadataIncrementalSerializer(configuration: CompilerConfiguration, project: Project, allowErrors: Boolean) =
     KlibMetadataIncrementalSerializer(
         languageVersionSettings = configuration.languageVersionSettings,
         metadataVersion = configuration.metadataVersion,
